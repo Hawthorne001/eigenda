@@ -7,12 +7,13 @@ import (
 
 	"github.com/Layr-Labs/eigenda/disperser"
 	"github.com/Layr-Labs/eigenda/disperser/common/blobstore"
+	"github.com/Layr-Labs/eigenda/disperser/common/semver"
+	"github.com/Layr-Labs/eigenda/operators"
 	"github.com/Layr-Labs/eigensdk-go/logging"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"google.golang.org/grpc/codes"
 )
 
 type MetricsConfig struct {
@@ -23,14 +24,14 @@ type MetricsConfig struct {
 type Metrics struct {
 	registry *prometheus.Registry
 
-	NumRequests *prometheus.CounterVec
-	Latency     *prometheus.SummaryVec
+	NumRequests    *prometheus.CounterVec
+	Latency        *prometheus.SummaryVec
+	OperatorsStake *prometheus.GaugeVec
 
-	PeriodicEjectionRequests *prometheus.CounterVec
-	UrgentEjectionRequests   *prometheus.CounterVec
-	OperatorsToEject         *prometheus.CounterVec
-	StakeShareToEject        *prometheus.GaugeVec
-	EjectionGasUsed          prometheus.Gauge
+	Semvers                *prometheus.GaugeVec
+	SemversStakePctQuorum0 *prometheus.GaugeVec
+	SemversStakePctQuorum1 *prometheus.GaugeVec
+	SemversStakePctQuorum2 *prometheus.GaugeVec
 
 	httpPort string
 	logger   logging.Logger
@@ -60,54 +61,43 @@ func NewMetrics(blobMetadataStore *blobstore.BlobMetadataStore, httpPort string,
 			},
 			[]string{"method"},
 		),
-		// PeriodicEjectionRequests is a more detailed metric than NumRequests, specifically for
-		// tracking the ejection calls that are periodically initiated according to the SLA
-		// evaluation time window.
-		PeriodicEjectionRequests: promauto.With(reg).NewCounterVec(
-			prometheus.CounterOpts{
-				Namespace: namespace,
-				Name:      "periodic_ejection_requests_total",
-				Help:      "the total number of periodic ejection requests",
+		Semvers: promauto.With(reg).NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "node_semvers",
+				Help: "Node semver install base",
 			},
-			[]string{"status"},
+			[]string{"semver"},
 		),
-		// UrgentEjectionRequests is a more detailed metric than NumRequests, specifically for
-		// tracking the ejection calls that are urgently initiated due to bad network health
-		// condition.
-		UrgentEjectionRequests: promauto.With(reg).NewCounterVec(
-			prometheus.CounterOpts{
-				Namespace: namespace,
-				Name:      "urgent_ejection_requests_total",
-				Help:      "the total number of urgent ejection requests",
+		SemversStakePctQuorum0: promauto.With(reg).NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "node_semvers_stake_pct_quorum_0",
+				Help: "Node semver stake percentage in quorum 0",
 			},
-			[]string{"status"},
+			[]string{"semver_stake_pct_quorum_0"},
 		),
-		// The number of operators requested to eject. Note this may be different than the
-		// actual number of operators ejected as EjectionManager contract may perform rate
-		// limiting.
-		OperatorsToEject: promauto.With(reg).NewCounterVec(
-			prometheus.CounterOpts{
-				Namespace: namespace,
-				Name:      "operators_to_eject",
-				Help:      "the total number of operators requested to eject",
-			}, []string{"quorum"},
+		SemversStakePctQuorum1: promauto.With(reg).NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "node_semvers_stake_pct_quorum_1",
+				Help: "Node semver stake percentage in quorum 1",
+			},
+			[]string{"semver_stake_pct_quorum_1"},
 		),
-		// The total stake share requested to eject. Note this may be different than the
-		// actual stake share ejected as EjectionManager contract may perform rate limiting.
-		StakeShareToEject: promauto.With(reg).NewGaugeVec(
+		SemversStakePctQuorum2: promauto.With(reg).NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "node_semvers_stake_pct_quorum_2",
+				Help: "Node semver stake percentage in quorum 2",
+			},
+			[]string{"semver_stake_pct_quorum_2"},
+		),
+		OperatorsStake: promauto.With(reg).NewGaugeVec(
 			prometheus.GaugeOpts{
 				Namespace: namespace,
-				Name:      "stake_share_to_eject",
-				Help:      "the total stake share requested to eject",
-			}, []string{"quorum"},
-		),
-		// The gas used by EjectionManager contract for operator ejection.
-		EjectionGasUsed: promauto.With(reg).NewGauge(
-			prometheus.GaugeOpts{
-				Namespace: namespace,
-				Name:      "ejection_gas_used",
-				Help:      "Gas used for operator ejection",
+				Name:      "operators_stake",
+				Help:      "the sum of stake percentages of top N operators",
 			},
+			// The "quorum" can be: total, 0, 1, ...
+			// The "topn" can be: 1, 2, 3, 5, 8, 10
+			[]string{"quorum", "topn"},
 		),
 		registry: reg,
 		httpPort: httpPort,
@@ -137,36 +127,12 @@ func (g *Metrics) IncrementFailedRequestNum(method string) {
 	}).Inc()
 }
 
-func (g *Metrics) IncrementEjectionRequest(mode string, status codes.Code) {
-	switch mode {
-	case "periodic":
-		g.PeriodicEjectionRequests.With(prometheus.Labels{
-			"status": status.String(),
-		}).Inc()
-	case "urgent":
-		g.UrgentEjectionRequests.With(prometheus.Labels{
-			"status": status.String(),
-		}).Inc()
-	}
-}
-
-func (g *Metrics) UpdateRequestedOperatorMetric(numOperatorsByQuorum map[uint8]int, stakeShareByQuorum map[uint8]float64) {
-	for q, count := range numOperatorsByQuorum {
-		for i := 0; i < count; i++ {
-			g.OperatorsToEject.With(prometheus.Labels{
-				"quorum": fmt.Sprintf("%d", q),
-			}).Inc()
-		}
-	}
-	for q, stakeShare := range stakeShareByQuorum {
-		g.StakeShareToEject.With(prometheus.Labels{
-			"quorum": fmt.Sprintf("%d", q),
-		}).Set(stakeShare)
-	}
-}
-
-func (g *Metrics) UpdateEjectionGasUsed(gasUsed uint64) {
-	g.EjectionGasUsed.Set(float64(gasUsed))
+// IncrementInvalidArgdRequestNum increments the number of failed requests with invalid args
+func (g *Metrics) IncrementInvalidArgRequestNum(method string) {
+	g.NumRequests.With(prometheus.Labels{
+		"status": "invalid_args",
+		"method": method,
+	}).Inc()
 }
 
 // IncrementNotFoundRequestNum increments the number of not found requests
@@ -175,6 +141,45 @@ func (g *Metrics) IncrementNotFoundRequestNum(method string) {
 		"status": "not found",
 		"method": method,
 	}).Inc()
+}
+
+// UpdateSemverMetrics updates the semver metrics
+func (g *Metrics) UpdateSemverCounts(semverData map[string]*semver.SemverMetrics) {
+	for semver, metrics := range semverData {
+		g.Semvers.WithLabelValues(semver).Set(float64(metrics.Operators))
+		for quorum, stakePct := range metrics.QuorumStakePercentage {
+			switch quorum {
+			case 0:
+				g.SemversStakePctQuorum0.WithLabelValues(semver).Set(stakePct)
+			case 1:
+				g.SemversStakePctQuorum1.WithLabelValues(semver).Set(stakePct)
+			case 2:
+				g.SemversStakePctQuorum2.WithLabelValues(semver).Set(stakePct)
+			default:
+				g.logger.Error("Unable to log semver quorum stake percentage for quorum", "semver", semver, "quorum", quorum, "stake", stakePct)
+			}
+		}
+	}
+}
+
+func (g *Metrics) updateStakeMetrics(rankedOperators []*operators.OperatorStakeShare, label string) {
+	indices := []int{0, 1, 2, 4, 7, 9}
+	accuStake := float64(0)
+	idx := 0
+	for i, op := range rankedOperators {
+		accuStake += op.StakeShare
+		if idx < len(indices) && i == indices[idx] {
+			g.OperatorsStake.WithLabelValues(label, fmt.Sprintf("%d", i+1)).Set(accuStake / 100)
+			idx++
+		}
+	}
+}
+
+func (g *Metrics) UpdateOperatorsStake(totalRanked []*operators.OperatorStakeShare, quorumRanked map[uint8][]*operators.OperatorStakeShare) {
+	g.updateStakeMetrics(totalRanked, "total")
+	for q, operators := range quorumRanked {
+		g.updateStakeMetrics(operators, fmt.Sprintf("%d", q))
+	}
 }
 
 // Start starts the metrics server
@@ -216,7 +221,7 @@ func (collector *DynamoDBCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (collector *DynamoDBCollector) Collect(ch chan<- prometheus.Metric) {
-	count, err := collector.blobMetadataStore.GetBlobMetadataByStatusCount(context.Background(), disperser.Processing)
+	count, err := collector.blobMetadataStore.GetBlobMetadataCountByStatus(context.Background(), disperser.Processing)
 	if err != nil {
 		collector.logger.Error("failed to get count of blob metadata by status", "err", err)
 		return

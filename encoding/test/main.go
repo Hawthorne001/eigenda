@@ -18,14 +18,15 @@ import (
 )
 
 func main() {
-	// TestKzgRs()
+	TestKzgRs()
 	//err := kzg.WriteGeneratorPoints(30000)
 	//if err != nil {
 	//	log.Println("WriteGeneratorPoints failed:", err)
 	//}
-	readpoints()
+	//readpoints()
 }
 
+/*
 func readpoints() {
 	kzgConfig := &kzg.KzgConfig{
 		G1Path:          "../../inabox/resources/kzg/g1.point",
@@ -47,9 +48,10 @@ func readpoints() {
 		fmt.Println("start with gen")
 	}
 }
+*/
 
 func TestKzgRs() {
-	numSymbols := 3
+	numSymbols := 1024
 	// encode parameters
 	numNode := uint64(4) // 200
 	numSys := uint64(2)  // 180
@@ -61,18 +63,22 @@ func TestKzgRs() {
 	//fmt.Printf("    Data size(byte): %v\n", len(inputBytes))
 
 	kzgConfig := &kzg.KzgConfig{
-		G1Path:          "g1.point",
-		G2Path:          "g2.point",
+		G1Path:          "../../inabox/resources/kzg/g1.point",
+		G2Path:          "../../inabox/resources/kzg/g2.point",
 		CacheDir:        "SRSTables",
 		SRSOrder:        3000,
 		SRSNumberToLoad: 3000,
 		NumWorker:       uint64(runtime.GOMAXPROCS(0)),
+		LoadG2Points:    true,
 	}
 
 	// create encoding object
-	p, _ := prover.NewProver(kzgConfig, true)
+	p, err := prover.NewProver(kzgConfig, nil)
+	if err != nil {
+		log.Fatalf("Failed to create prover: %v", err)
+	}
 
-	params := encoding.EncodingParams{NumChunks: 200, ChunkLength: 180}
+	params := encoding.EncodingParams{NumChunks: numNode, ChunkLength: uint64(numSymbols) / numSys}
 	enc, _ := p.GetKzgEncoder(params)
 
 	//inputFr := kzg.ToFrArray(inputBytes)
@@ -110,9 +116,13 @@ func TestKzgRs() {
 		}
 
 		fmt.Printf("frame %v leading coset %v\n", i, j)
-		lc := enc.Fs.ExpandedRootsOfUnity[uint64(j)]
+		rsEncoder, err := enc.GetRsEncoder(params)
+		if err != nil {
+			log.Fatalf("%v", err)
+		}
+		lc := rsEncoder.Fs.ExpandedRootsOfUnity[uint64(j)]
 
-		g2Atn, err := kzg.ReadG2Point(uint64(len(f.Coeffs)), kzgConfig)
+		g2Atn, err := kzg.ReadG2Point(uint64(len(f.Coeffs)), kzgConfig.SRSOrder, kzgConfig.G2Path)
 		if err != nil {
 			log.Fatalf("Load g2 %v failed\n", err)
 		}

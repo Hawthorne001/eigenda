@@ -2,6 +2,7 @@ package deploy
 
 import (
 	"encoding/json"
+	"github.com/ethereum/go-ethereum/common"
 	"log"
 	"os"
 	"path/filepath"
@@ -103,6 +104,7 @@ type EigenDAContract struct {
 	OperatorStateRetreiver string `json:"operatorStateRetriever"`
 	BlsApkRegistry         string `json:"blsApkRegistry"`
 	RegistryCoordinator    string `json:"registryCoordinator"`
+	BlobVerifier           string `json:"blobVerifier"`
 }
 
 type Stakes struct {
@@ -112,9 +114,9 @@ type Stakes struct {
 
 type ServicesSpec struct {
 	Counts struct {
-		NumDis              int `yaml:"dispersers"`
 		NumOpr              int `yaml:"operators"`
 		NumMaxOperatorCount int `yaml:"maxOperatorCount"`
+		NumRelays           int `yaml:"relays"`
 	} `yaml:"counts"`
 	Stakes    []Stakes  `yaml:"stakes"`
 	BasePort  int       `yaml:"basePort"`
@@ -130,6 +132,12 @@ type KeyInfo struct {
 	Password string `yaml:"password"`
 	// The file path to the encrypted private key.
 	KeyFile string `yaml:"keyFile"`
+}
+
+type BlobVersionParam struct {
+	CodingRate      uint32 `yaml:"codingRate"`
+	MaxNumOperators uint32 `yaml:"maxNumOperators"`
+	NumChunks       uint32 `yaml:"numChunks"`
 }
 
 type PkConfig struct {
@@ -156,8 +164,9 @@ type Config struct {
 
 	Deployers []*ContractDeployer `yaml:"deployers"`
 
-	EigenDA    EigenDAContract `yaml:"eigenda"`
-	MockRollup string          `yaml:"mockRollup" json:"mockRollup"`
+	EigenDA           EigenDAContract     `yaml:"eigenda"`
+	BlobVersionParams []*BlobVersionParam `yaml:"blobVersions"`
+	MockRollup        string              `yaml:"mockRollup" json:"mockRollup"`
 
 	Pks *PkConfig `yaml:"privateKeys"`
 
@@ -172,10 +181,21 @@ type Config struct {
 	Operators  []OperatorVars
 	Stakers    []Staker
 	Retriever  RetrieverVars
+	Controller ControllerVars
+	Relays     []RelayVars
+
+	localstackEndpoint string
+	localstackRegion   string
+
+	// DisperserAddress is the address of disperser 0 (aka the only disperser at the current time)
+	DisperserAddress common.Address
+
+	// DisperserKMSKeyID is the KMS key ID used to encrypt disperser data
+	DisperserKMSKeyID string
 }
 
-func (c Config) IsEigenDADeployed() bool {
-	return c.EigenDA.ServiceManager != ""
+func (env *Config) IsEigenDADeployed() bool {
+	return env.EigenDA.ServiceManager != ""
 }
 
 func NewTestConfig(testName, rootPath string) (testEnv *Config) {

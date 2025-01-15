@@ -40,7 +40,7 @@ func TestBatchHeaderEncoding(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, hexutil.Encode(hash[:]), reducedBatchHeaderHash)
 
-	onchainBatchHeader := binding.IEigenDAServiceManagerBatchHeader{
+	onchainBatchHeader := binding.BatchHeader{
 		BlobHeadersRoot:       batchRoot,
 		QuorumNumbers:         []byte{0},
 		SignedStakeForQuorums: []byte{100},
@@ -209,4 +209,15 @@ func TestParseOperatorSocket(t *testing.T) {
 	_, _, _, err = core.ParseOperatorSocket("localhost1234;5678")
 	assert.NotNil(t, err)
 	assert.Equal(t, "invalid socket address format: localhost1234;5678", err.Error())
+}
+
+func TestSignatureBytes(t *testing.T) {
+	sig := &core.Signature{
+		G1Point: core.NewG1Point(big.NewInt(1), big.NewInt(2)),
+	}
+	bytes := sig.Bytes()
+	recovered := new(bn254.G1Affine)
+	_, err := recovered.SetBytes(bytes[:])
+	assert.NoError(t, err)
+	assert.Equal(t, recovered, sig.G1Point.G1Affine)
 }

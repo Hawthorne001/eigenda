@@ -2,9 +2,10 @@ package dataapi
 
 import (
 	"context"
-	"errors"
+	"math/big"
 	"net"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/Layr-Labs/eigenda/core"
@@ -95,6 +96,84 @@ func (s *server) getRegisteredOperatorForDays(ctx context.Context, days int32) (
 	return RegisteredOperatorMetadata, nil
 }
 
+// Function to get operator ejection over last N days
+// Returns list of Ejections with operatorId, quorum, block number, txn and timestemp if ejection
+func (s *server) getOperatorEjections(ctx context.Context, days int32, operatorId string, first uint, skip uint) ([]*QueriedOperatorEjections, error) {
+	startTime := time.Now()
+
+	operatorEjections, err := s.subgraphClient.QueryOperatorEjectionsForTimeWindow(ctx, days, operatorId, first, skip)
+	if err != nil {
+		return nil, err
+	}
+
+	// create a sorted slice from the set of quorums
+	quorumSet := make(map[uint8]struct{})
+	for _, ejection := range operatorEjections {
+		quorumSet[ejection.Quorum] = struct{}{}
+	}
+	quorums := make([]uint8, 0, len(quorumSet))
+	for quorum := range quorumSet {
+		quorums = append(quorums, quorum)
+	}
+	sort.Slice(quorums, func(i, j int) bool {
+		return quorums[i] < quorums[j]
+	})
+
+	stateCache := make(map[uint64]*core.OperatorState)
+	ejectedOperatorIds := make(map[core.OperatorID]struct{})
+	for _, ejection := range operatorEjections {
+		previouseBlock := ejection.BlockNumber - 1
+		if _, exists := stateCache[previouseBlock]; !exists {
+			state, err := s.chainState.GetOperatorState(context.Background(), uint(previouseBlock), quorums)
+			if err != nil {
+				return nil, err
+			}
+			stateCache[previouseBlock] = state
+		}
+
+		// construct a set of ejected operator ids for later batch address lookup
+		opID, err := core.OperatorIDFromHex(ejection.OperatorId)
+		if err != nil {
+			return nil, err
+		}
+		ejectedOperatorIds[opID] = struct{}{}
+	}
+
+	// resolve operator id to operator addresses mapping
+	operatorIDs := make([]core.OperatorID, 0, len(ejectedOperatorIds))
+	for opID := range ejectedOperatorIds {
+		operatorIDs = append(operatorIDs, opID)
+	}
+	operatorAddresses, err := s.transactor.BatchOperatorIDToAddress(ctx, operatorIDs)
+	if err != nil {
+		return nil, err
+	}
+	operatorIdToAddress := make(map[string]string)
+	for i := range operatorAddresses {
+		operatorIdToAddress["0x"+operatorIDs[i].Hex()] = strings.ToLower(operatorAddresses[i].Hex())
+	}
+
+	for _, ejection := range operatorEjections {
+		state := stateCache[ejection.BlockNumber-1]
+		opID, err := core.OperatorIDFromHex(ejection.OperatorId)
+		if err != nil {
+			return nil, err
+		}
+
+		stakePercentage := float64(0)
+		if stake, ok := state.Operators[ejection.Quorum][opID]; ok {
+			totalStake := new(big.Float).SetInt(state.Totals[ejection.Quorum].Stake)
+			operatorStake := new(big.Float).SetInt(stake.Stake)
+			stakePercentage, _ = new(big.Float).Mul(big.NewFloat(100), new(big.Float).Quo(operatorStake, totalStake)).Float64()
+		}
+		ejection.StakePercentage = stakePercentage
+		ejection.OperatorAddress = operatorIdToAddress[ejection.OperatorId]
+	}
+
+	s.logger.Info("Get operator ejections", "days", days, "operatorId", operatorId, "len", len(operatorEjections), "duration", time.Since(startTime))
+	return operatorEjections, nil
+}
+
 func processOperatorOnlineCheck(queriedOperatorsInfo *IndexedQueriedOperatorInfo, operatorOnlineStatusresultsChan chan<- *QueriedStateOperatorMetadata, logger logging.Logger) {
 	operators := queriedOperatorsInfo.Operators
 	wp := workerpool.New(poolSize)
@@ -166,39 +245,7 @@ func ValidOperatorIP(address string, logger logging.Logger) bool {
 	return isValid
 }
 
-func (s *server) probeOperatorPorts(ctx context.Context, operatorId string) (*OperatorPortCheckResponse, error) {
-	operatorInfo, err := s.subgraphClient.QueryOperatorInfoByOperatorId(context.Background(), operatorId)
-	if err != nil {
-		s.logger.Warn("failed to fetch operator info", "operatorId", operatorId, "error", err)
-		return &OperatorPortCheckResponse{}, errors.New("operator info not found")
-	}
-
-	operatorSocket := core.OperatorSocket(operatorInfo.Socket)
-	retrievalSocket := operatorSocket.GetRetrievalSocket()
-	retrievalOnline := checkIsOperatorOnline(retrievalSocket, 3, s.logger)
-
-	dispersalSocket := operatorSocket.GetDispersalSocket()
-	dispersalOnline := checkIsOperatorOnline(dispersalSocket, 3, s.logger)
-
-	// Create the metadata regardless of online status
-	portCheckResponse := &OperatorPortCheckResponse{
-		OperatorId:      operatorId,
-		DispersalSocket: dispersalSocket,
-		RetrievalSocket: retrievalSocket,
-		DispersalOnline: dispersalOnline,
-		RetrievalOnline: retrievalOnline,
-	}
-
-	// Log the online status
-	s.logger.Info("operator port check response", "response", portCheckResponse)
-
-	// Send the metadata to the results channel
-	return portCheckResponse, nil
-}
-
-// method to check if operator is online
-// Note: This method is least intrusive way to check if operator is online
-// AlternateSolution: Should we add an endpt to check if operator is online?
+// method to check if operator is online via socket dial
 func checkIsOperatorOnline(socket string, timeoutSecs int, logger logging.Logger) bool {
 	if !ValidOperatorIP(socket, logger) {
 		logger.Error("port check blocked invalid operator IP", "socket", socket)

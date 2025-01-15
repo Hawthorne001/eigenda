@@ -2,27 +2,41 @@ package node_test
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"os"
 	"runtime"
 	"testing"
 	"time"
 
+	clientsmock "github.com/Layr-Labs/eigenda/api/clients/v2/mock"
 	"github.com/Layr-Labs/eigenda/common"
 	"github.com/Layr-Labs/eigenda/common/geth"
 	"github.com/Layr-Labs/eigenda/core"
 	coremock "github.com/Layr-Labs/eigenda/core/mock"
+	v2 "github.com/Layr-Labs/eigenda/core/v2"
 	"github.com/Layr-Labs/eigenda/node"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
 
-var privateKey = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-var opID = [32]byte{}
+var (
+	privateKey = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+	opID       = [32]byte{0}
+
+	blobParams = &core.BlobVersionParameters{
+		NumChunks:       8192,
+		CodingRate:      8,
+		MaxNumOperators: 3537,
+	}
+	blobParamsMap = map[v2.BlobVersion]*core.BlobVersionParameters{
+		0: blobParams,
+	}
+)
 
 type components struct {
-	node *node.Node
-	tx   *coremock.MockTransactor
+	node        *node.Node
+	tx          *coremock.MockWriter
+	relayClient *clientsmock.MockRelayClient
 }
 
 func newComponents(t *testing.T) *components {
@@ -31,7 +45,6 @@ func newComponents(t *testing.T) *components {
 	if err != nil {
 		panic("failed to create a BLS Key")
 	}
-	copy(opID[:], []byte(fmt.Sprintf("%d", 3)))
 	config := &node.Config{
 		Timeout:                   10 * time.Second,
 		ExpirationPollIntervalSec: 1,
@@ -53,10 +66,9 @@ func newComponents(t *testing.T) *components {
 	if err != nil {
 		panic("failed to create a directory for db")
 	}
-	tx := &coremock.MockTransactor{}
+	tx := &coremock.MockWriter{}
 
 	mockVal := coremock.NewMockShardValidator()
-	mockVal.On("ValidateBlob", mock.Anything, mock.Anything).Return(nil)
 	mockVal.On("ValidateBatch", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
 	chainState, _ := coremock.MakeChainDataMock(map[uint8]int{
@@ -70,25 +82,29 @@ func newComponents(t *testing.T) *components {
 		panic("failed to create a new levelDB store")
 	}
 	defer os.Remove(dbPath)
-
+	n := &node.Node{
+		Config:     config,
+		Logger:     logger,
+		KeyPair:    keyPair,
+		Metrics:    nil,
+		Store:      store,
+		ChainState: chainState,
+		Validator:  mockVal,
+		Transactor: tx,
+	}
+	n.BlobVersionParams.Store(v2.NewBlobVersionParameterMap(blobParamsMap))
 	return &components{
-		node: &node.Node{
-			Config:     config,
-			Logger:     logger,
-			KeyPair:    keyPair,
-			Metrics:    nil,
-			Store:      store,
-			ChainState: chainState,
-			Validator:  mockVal,
-			Transactor: tx,
-		},
-		tx: tx,
+		node:        n,
+		tx:          tx,
+		relayClient: clientsmock.NewRelayClient(),
 	}
 }
 
 func TestNodeStartNoAddress(t *testing.T) {
 	c := newComponents(t)
 	c.node.Config.RegisterNodeAtStart = false
+
+	c.tx.On("GetOperatorSocket", mock.Anything).Return("", errors.New("failed to get operator socket"))
 
 	err := c.node.Start(context.Background())
 	assert.NoError(t, err)
@@ -109,7 +125,7 @@ func TestNodeStartOperatorIDMatch(t *testing.T) {
 		ChurnBIPsOfTotalStake:    uint16(10),
 	}, nil)
 	c.tx.On("GetNumberOfRegisteredOperatorForQuorum", mock.Anything, mock.Anything).Return(uint32(0), nil)
-	c.tx.On("RegisterOperator", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	c.tx.On("RegisterOperator", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
 	c.tx.On("OperatorAddressToID", mock.Anything).Return(core.OperatorID(opID), nil)
 
@@ -132,7 +148,7 @@ func TestNodeStartOperatorIDDoesNotMatch(t *testing.T) {
 		ChurnBIPsOfTotalStake:    uint16(10),
 	}, nil)
 	c.tx.On("GetNumberOfRegisteredOperatorForQuorum", mock.Anything, mock.Anything).Return(uint32(0), nil)
-	c.tx.On("RegisterOperator", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	c.tx.On("RegisterOperator", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
 	c.tx.On("OperatorAddressToID", mock.Anything).Return(core.OperatorID{1}, nil)
 

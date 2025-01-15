@@ -2,11 +2,14 @@ package mock
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math/big"
 	"sort"
 
 	"github.com/Layr-Labs/eigenda/core"
+	blssigner "github.com/Layr-Labs/eigensdk-go/signer/bls"
+	blssignerTypes "github.com/Layr-Labs/eigensdk-go/signer/bls/types"
 	"github.com/stretchr/testify/mock"
 )
 
@@ -24,6 +27,7 @@ var _ core.IndexedChainState = (*ChainDataMock)(nil)
 type PrivateOperatorInfo struct {
 	*core.IndexedOperatorInfo
 	KeyPair       *core.KeyPair
+	Signer        blssigner.Signer
 	Host          string
 	DispersalPort string
 	RetrievalPort string
@@ -36,7 +40,8 @@ type PrivateOperatorState struct {
 }
 
 func MakeOperatorId(id int) core.OperatorID {
-	data := [32]byte{uint8(id)}
+	var data [32]byte
+	binary.LittleEndian.PutUint64(data[:8], uint64(id))
 	return data
 }
 
@@ -141,9 +146,15 @@ func (d *ChainDataMock) GetTotalOperatorStateWithQuorums(ctx context.Context, bl
 			PubkeyG2: d.KeyPairs[id].GetPubKeyG2(),
 		}
 
+		signer, _ := blssigner.NewSigner(blssignerTypes.SignerConfig{
+			PrivateKey: d.KeyPairs[id].PrivKey.String(),
+			SignerType: blssignerTypes.PrivateKey,
+		})
+
 		private := &PrivateOperatorInfo{
 			IndexedOperatorInfo: indexed,
 			KeyPair:             d.KeyPairs[id],
+			Signer:              signer,
 			Host:                host,
 			DispersalPort:       dispersalPort,
 			RetrievalPort:       retrievalPort,
@@ -236,12 +247,25 @@ func (d *ChainDataMock) GetOperatorStateByOperator(ctx context.Context, blockNum
 
 }
 
+func (d *ChainDataMock) GetOperatorSocket(ctx context.Context, blockNumber uint, operator core.OperatorID) (string, error) {
+
+	state := d.GetTotalOperatorState(ctx, blockNumber)
+
+	return state.IndexedOperatorState.IndexedOperators[operator].Socket, nil
+}
+
 func (d *ChainDataMock) GetIndexedOperatorState(ctx context.Context, blockNumber uint, quorums []core.QuorumID) (*core.IndexedOperatorState, error) {
 
 	state := d.GetTotalOperatorStateWithQuorums(ctx, blockNumber, quorums)
 
 	return state.IndexedOperatorState, nil
 
+}
+
+func (d *ChainDataMock) GetIndexedOperators(ctx context.Context, blockNumber uint) (map[core.OperatorID]*core.IndexedOperatorInfo, error) {
+	state := d.GetTotalOperatorState(ctx, blockNumber)
+
+	return state.IndexedOperatorState.IndexedOperators, nil
 }
 
 func (d *ChainDataMock) GetCurrentBlockNumber() (uint, error) {

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -14,17 +13,17 @@ import (
 	"github.com/Layr-Labs/eigenda/common/aws/s3"
 	"github.com/Layr-Labs/eigenda/common/geth"
 	coreeth "github.com/Layr-Labs/eigenda/core/eth"
+	"github.com/Layr-Labs/eigenda/core/thegraph"
 	"github.com/Layr-Labs/eigenda/disperser/cmd/dataapi/flags"
 	"github.com/Layr-Labs/eigenda/disperser/common/blobstore"
+	blobstorev2 "github.com/Layr-Labs/eigenda/disperser/common/v2/blobstore"
 	"github.com/Layr-Labs/eigenda/disperser/dataapi"
 	"github.com/Layr-Labs/eigenda/disperser/dataapi/prometheus"
 	"github.com/Layr-Labs/eigenda/disperser/dataapi/subgraph"
-	walletsdk "github.com/Layr-Labs/eigensdk-go/chainio/clients/wallet"
+	serverv2 "github.com/Layr-Labs/eigenda/disperser/dataapi/v2"
 	"github.com/Layr-Labs/eigensdk-go/logging"
-	"github.com/Layr-Labs/eigensdk-go/signerv2"
 
 	gethcommon "github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/urfave/cli"
 )
 
@@ -35,7 +34,7 @@ var (
 	gitDate   string
 )
 
-// @title			EigenDA Data Access API
+// @title			EigenDA Data Access API V1
 // @description	This is the EigenDA Data Access API server.
 // @version		1
 // @Schemes		https http
@@ -82,25 +81,16 @@ func RunDataApi(ctx *cli.Context) error {
 		return err
 	}
 
-	sender := gethcommon.Address{}
-	if !config.FireblocksConfig.Disable {
-		sender = gethcommon.HexToAddress(config.FireblocksConfig.WalletAddress)
-	}
-
-	client, err := geth.NewMultiHomingClient(config.EthClientConfig, sender, logger)
+	client, err := geth.NewMultiHomingClient(config.EthClientConfig, gethcommon.Address{}, logger)
 	if err != nil {
 		return err
 	}
 
-	tx, err := coreeth.NewTransactor(logger, client, config.BLSOperatorStateRetrieverAddr, config.EigenDAServiceManagerAddr)
+	tx, err := coreeth.NewReader(logger, client, config.BLSOperatorStateRetrieverAddr, config.EigenDAServiceManagerAddr)
 	if err != nil {
 		return err
 	}
 
-	wallet, err := getWallet(config, client, logger)
-	if err != nil {
-		return err
-	}
 	var (
 		promClient        = dataapi.NewPrometheusClient(promApi, config.PrometheusConfig.Cluster)
 		blobMetadataStore = blobstore.NewBlobMetadataStore(dynamoClient, logger, config.BlobstoreConfig.TableName, 0)
@@ -108,13 +98,13 @@ func RunDataApi(ctx *cli.Context) error {
 		subgraphApi       = subgraph.NewApi(config.SubgraphApiBatchMetadataAddr, config.SubgraphApiOperatorStateAddr)
 		subgraphClient    = dataapi.NewSubgraphClient(subgraphApi, logger)
 		chainState        = coreeth.NewChainState(tx, client)
+		indexedChainState = thegraph.MakeIndexedChainState(config.ChainStateConfig, chainState, logger)
 		metrics           = dataapi.NewMetrics(blobMetadataStore, config.MetricsConfig.HTTPPort, logger)
 		server            = dataapi.NewServer(
 			dataapi.Config{
 				ServerMode:         config.ServerMode,
 				SocketAddr:         config.SocketAddr,
 				AllowOrigins:       config.AllowOrigins,
-				EjectionToken:      config.EjectionToken,
 				DisperserHostname:  config.DisperserHostname,
 				ChurnerHostname:    config.ChurnerHostname,
 				BatcherHealthEndpt: config.BatcherHealthEndpt,
@@ -124,7 +114,7 @@ func RunDataApi(ctx *cli.Context) error {
 			subgraphClient,
 			tx,
 			chainState,
-			dataapi.NewEjector(wallet, client, logger, tx, metrics, config.TxnTimeout, config.NonsigningRateThreshold),
+			indexedChainState,
 			logger,
 			metrics,
 			nil,
@@ -140,6 +130,33 @@ func RunDataApi(ctx *cli.Context) error {
 		logger.Info("Enabled metrics for Data Access API", "socket", httpSocket)
 	}
 
+	if config.ServerVersion == 2 {
+		blobMetadataStorev2 := blobstorev2.NewBlobMetadataStore(dynamoClient, logger, config.BlobstoreConfig.TableName)
+		serverv2 := serverv2.NewServerV2(
+			dataapi.Config{
+				ServerMode:         config.ServerMode,
+				SocketAddr:         config.SocketAddr,
+				AllowOrigins:       config.AllowOrigins,
+				DisperserHostname:  config.DisperserHostname,
+				ChurnerHostname:    config.ChurnerHostname,
+				BatcherHealthEndpt: config.BatcherHealthEndpt,
+			},
+			blobMetadataStorev2,
+			promClient,
+			subgraphClient,
+			tx,
+			chainState,
+			indexedChainState,
+			logger,
+			metrics,
+		)
+		return runServer(serverv2, logger)
+	}
+
+	return runServer(server, logger)
+}
+
+func runServer[T dataapi.ServerInterface](server T, logger logging.Logger) error {
 	// Setup channel to listen for termination signals
 	quit := make(chan os.Signal, 1)
 	// catch SIGINT (Ctrl+C) and SIGTERM (e.g., from `kill`)
@@ -155,40 +172,11 @@ func RunDataApi(ctx *cli.Context) error {
 	// Block until a signal is received.
 	<-quit
 	logger.Info("Shutting down server...")
-	err = server.Shutdown()
+	err := server.Shutdown()
 
 	if err != nil {
 		logger.Errorf("Failed to shutdown server: %v", err)
 	}
 
 	return err
-}
-
-func getWallet(config Config, ethClient common.EthClient, logger logging.Logger) (walletsdk.Wallet, error) {
-	var wallet walletsdk.Wallet
-	if !config.FireblocksConfig.Disable {
-		return common.NewFireblocksWallet(&config.FireblocksConfig, ethClient, logger)
-	} else if len(config.EthClientConfig.PrivateKeyString) > 0 {
-		privateKey, err := crypto.HexToECDSA(config.EthClientConfig.PrivateKeyString)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse private key: %w", err)
-		}
-		chainID, err := ethClient.ChainID(context.Background())
-		if err != nil {
-			return nil, fmt.Errorf("failed to get chain ID: %w", err)
-		}
-		signerV2, address, err := signerv2.SignerFromConfig(signerv2.Config{PrivateKey: privateKey}, chainID)
-		if err != nil {
-			return nil, err
-		}
-		wallet, err = walletsdk.NewPrivateKeyWallet(ethClient, signerV2, address, logger.With("component", "PrivateKeyWallet"))
-		if err != nil {
-			return nil, err
-		}
-		logger.Info("Initialized PrivateKey wallet", "address", address.Hex())
-	} else {
-		return nil, errors.New("no wallet is configured. Either Fireblocks or PrivateKey wallet should be configured")
-	}
-
-	return wallet, nil
 }

@@ -14,13 +14,14 @@ func FuzzOnlySystematic(f *testing.F) {
 	f.Fuzz(func(t *testing.T, input []byte) {
 
 		params := encoding.ParamsFromSysPar(10, 3, uint64(len(input)))
-		enc, err := rs.NewEncoder(params, true)
+		cfg := encoding.DefaultConfig()
+		enc, err := rs.NewEncoder(cfg)
 		if err != nil {
 			t.Errorf("Error making rs: %q", err)
 		}
 
 		//encode the data
-		_, frames, _, err := enc.EncodeBytes(input)
+		frames, _, err := enc.EncodeBytes(input, params)
 		if err != nil {
 			t.Errorf("Error Encoding:\n Data:\n %q \n Err: %q", input, err)
 		}
@@ -28,7 +29,7 @@ func FuzzOnlySystematic(f *testing.F) {
 		//sample the correct systematic frames
 		samples, indices := sampleFrames(frames, uint64(len(frames)))
 
-		data, err := enc.Decode(samples, indices, uint64(len(input)))
+		data, err := enc.Decode(samples, indices, uint64(len(input)), params)
 		if err != nil {
 			t.Errorf("Error Decoding:\n Data:\n %q \n Err: %q", input, err)
 		}
