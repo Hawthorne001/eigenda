@@ -7,5 +7,11 @@ type Config struct {
 	DisperserHostname  string
 	ChurnerHostname    string
 	BatcherHealthEndpt string
-	EjectionToken      string
 }
+
+type DataApiVersion uint
+
+const (
+	V1 DataApiVersion = 1
+	V2 DataApiVersion = 2
+)

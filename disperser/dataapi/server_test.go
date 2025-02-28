@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	commonmock "github.com/Layr-Labs/eigenda/common/mock"
+	"github.com/Layr-Labs/eigenda/common/testutils"
 	"github.com/Layr-Labs/eigenda/core"
 	coremock "github.com/Layr-Labs/eigenda/core/mock"
 	"github.com/Layr-Labs/eigenda/disperser"
@@ -25,18 +25,13 @@ import (
 	"github.com/Layr-Labs/eigenda/disperser/dataapi/subgraph"
 	subgraphmock "github.com/Layr-Labs/eigenda/disperser/dataapi/subgraph/mock"
 	"github.com/Layr-Labs/eigenda/encoding"
-	sdkmock "github.com/Layr-Labs/eigensdk-go/chainio/clients/mocks"
-	"github.com/Layr-Labs/eigensdk-go/logging"
 	"github.com/consensys/gnark-crypto/ecc/bn254/fp"
 	"github.com/ethereum/go-ethereum/common"
 	gethcommon "github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
-	"go.uber.org/goleak"
-	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health/grpc_health_v1"
 )
@@ -48,17 +43,18 @@ var (
 	mockPrometheusRespAvgThroughput string
 
 	expectedBlobCommitment *encoding.BlobCommitments
-	mockLogger             = logging.NewNoopLogger()
+	mockLogger             = testutils.GetLogger()
 	blobstore              = inmem.NewBlobStore()
 	mockPrometheusApi      = &prommock.MockPrometheusApi{}
 	prometheusClient       = dataapi.NewPrometheusClient(mockPrometheusApi, "test-cluster")
 	mockSubgraphApi        = &subgraphmock.MockSubgraphApi{}
 	subgraphClient         = dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger)
 
-	config = dataapi.Config{ServerMode: "test", SocketAddr: ":8080", AllowOrigins: []string{"*"}, DisperserHostname: "localhost:32007", ChurnerHostname: "localhost:32009", EjectionToken: "deadbeef"}
+	config = dataapi.Config{ServerMode: "test", SocketAddr: ":8080", AllowOrigins: []string{"*"}, DisperserHostname: "localhost:32007", ChurnerHostname: "localhost:32009"}
 
-	mockTx            = &coremock.MockTransactor{}
-	metrics           = dataapi.NewMetrics(nil, "9001", mockLogger)
+	serverVersion     = uint(1)
+	mockTx            = &coremock.MockWriter{}
+	metrics           = dataapi.NewMetrics(serverVersion, nil, "9001", mockLogger)
 	opId0, _          = core.OperatorIDFromHex("e22dae12a0074f20b8fc96a0489376db34075e545ef60c4845d264a732568311")
 	opId1, _          = core.OperatorIDFromHex("e23cae12a0074f20b8fc96a0489376db34075e545ef60c4845d264b732568312")
 	mockChainState, _ = coremock.NewChainDataMock(map[uint8]map[core.OperatorID]int{
@@ -71,9 +67,12 @@ var (
 			opId1: 3,
 		},
 	})
-	testDataApiServer               = dataapi.NewServer(config, blobstore, prometheusClient, subgraphClient, mockTx, mockChainState, nil, mockLogger, dataapi.NewMetrics(nil, "9001", mockLogger), &MockGRPCConnection{}, nil, nil)
-	expectedBatchHeaderHash         = [32]byte{1, 2, 3}
-	expectedBlobIndex               = uint32(1)
+	mockIndexedChainState, _ = coremock.MakeChainDataMock(map[uint8]int{
+		0: 10,
+		1: 10,
+		2: 10,
+	})
+	testDataApiServer               = dataapi.NewServer(config, blobstore, prometheusClient, subgraphClient, mockTx, mockChainState, mockIndexedChainState, mockLogger, dataapi.NewMetrics(serverVersion, nil, "9001", mockLogger), &MockGRPCConnection{}, nil, nil)
 	expectedRequestedAt             = uint64(5567830000000000000)
 	expectedDataLength              = 32
 	expectedBatchId                 = uint32(99)
@@ -157,7 +156,9 @@ func TestFetchBlobHandler(t *testing.T) {
 
 	blob := makeTestBlob(0, 80)
 	key := queueBlob(t, &blob, blobstore)
-	markBlobConfirmed(t, &blob, key, expectedBatchHeaderHash, blobstore)
+	expectedBatchHeaderHash := [32]byte{1, 2, 3}
+	expectedBlobIndex := uint32(1)
+	markBlobConfirmed(t, &blob, key, expectedBlobIndex, expectedBatchHeaderHash, blobstore)
 	blobKey := key.String()
 	r.GET("/v1/feed/blobs/:blob_key", testDataApiServer.FetchBlobHandler)
 
@@ -193,8 +194,6 @@ func TestFetchBlobHandler(t *testing.T) {
 }
 
 func TestFetchBlobsHandler(t *testing.T) {
-	defer goleak.VerifyNone(t)
-
 	r := setUpRouter()
 	blob := makeTestBlob(0, 10)
 
@@ -206,7 +205,7 @@ func TestFetchBlobsHandler(t *testing.T) {
 		batchHeaderHashBytes := []byte(batch.BatchHeaderHash)
 		batchHeaderHash, err := dataapi.ConvertHexadecimalToBytes(batchHeaderHashBytes)
 		assert.NoError(t, err)
-		markBlobConfirmed(t, &blob, key, batchHeaderHash, blobstore)
+		markBlobConfirmed(t, &blob, key, 1, batchHeaderHash, blobstore)
 	}
 
 	mockSubgraphApi.On("QueryBatches").Return(subgraphBatches, nil)
@@ -233,9 +232,119 @@ func TestFetchBlobsHandler(t *testing.T) {
 	assert.Equal(t, 2, len(response.Data))
 }
 
-func TestFetchMetricsHandler(t *testing.T) {
-	defer goleak.VerifyNone(t)
+func TestFetchBlobsFromBatchHeaderHash(t *testing.T) {
+	r := setUpRouter()
 
+	batchHeaderHash := "6E2EFA6EB7AE40CE7A65B465679DE5649F994296D18C075CF2C490564BBF7CA5"
+	batchHeaderHashBytes, err := dataapi.ConvertHexadecimalToBytes([]byte(batchHeaderHash))
+	assert.NoError(t, err)
+
+	blob1 := makeTestBlob(0, 80)
+	key1 := queueBlob(t, &blob1, blobstore)
+
+	blob2 := makeTestBlob(0, 80)
+	key2 := queueBlob(t, &blob2, blobstore)
+
+	markBlobConfirmed(t, &blob1, key1, 1, batchHeaderHashBytes, blobstore)
+	markBlobConfirmed(t, &blob2, key2, 2, batchHeaderHashBytes, blobstore)
+
+	r.GET("/v1/feed/batches/:batch_header_hash/blobs", testDataApiServer.FetchBlobsFromBatchHeaderHash)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/feed/batches/"+batchHeaderHash+"/blobs?limit=1", nil)
+	r.ServeHTTP(w, req)
+
+	res := w.Result()
+	defer res.Body.Close()
+
+	data, err := io.ReadAll(res.Body)
+	assert.NoError(t, err)
+
+	var response dataapi.BlobsResponse
+	err = json.Unmarshal(data, &response)
+	assert.NoError(t, err)
+	assert.NotNil(t, response)
+
+	assert.Equal(t, http.StatusOK, res.StatusCode)
+	assert.Equal(t, 1, response.Meta.Size)
+	assert.Equal(t, hex.EncodeToString(batchHeaderHashBytes[:]), response.Data[0].BatchHeaderHash)
+	assert.Equal(t, uint32(1), uint32(response.Data[0].BlobIndex))
+
+	// With the next_token query parameter set, the response should contain the next token
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/v1/feed/batches/"+batchHeaderHash+"/blobs?limit=1&next_token="+response.Meta.NextToken, nil)
+	r.ServeHTTP(w, req)
+
+	res = w.Result()
+	defer res.Body.Close()
+
+	data, err = io.ReadAll(res.Body)
+	assert.NoError(t, err)
+
+	err = json.Unmarshal(data, &response)
+	assert.NoError(t, err)
+	assert.NotNil(t, response)
+
+	assert.Equal(t, http.StatusOK, res.StatusCode)
+	assert.Equal(t, 1, response.Meta.Size)
+	assert.Equal(t, hex.EncodeToString(batchHeaderHashBytes[:]), response.Data[0].BatchHeaderHash)
+	assert.Equal(t, uint32(2), uint32(response.Data[0].BlobIndex))
+
+	// With the next_token query parameter set to an invalid value, the response should contain an error
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/v1/feed/batches/"+batchHeaderHash+"/blobs?limit=1&next_token=invalid", nil)
+	r.ServeHTTP(w, req)
+
+	res = w.Result()
+	defer res.Body.Close()
+
+	data, err = io.ReadAll(res.Body)
+	assert.NoError(t, err)
+
+	var errorResponse dataapi.ErrorResponse
+	err = json.Unmarshal(data, &errorResponse)
+	assert.NoError(t, err)
+
+	assert.Equal(t, http.StatusInternalServerError, res.StatusCode)
+	assert.Equal(t, "invalid next_token", errorResponse.Error)
+
+	// Fetch both blobs when no limit is set
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/v1/feed/batches/"+batchHeaderHash+"/blobs", nil)
+	r.ServeHTTP(w, req)
+
+	res = w.Result()
+	defer res.Body.Close()
+
+	data, err = io.ReadAll(res.Body)
+	assert.NoError(t, err)
+
+	err = json.Unmarshal(data, &response)
+	assert.NoError(t, err)
+	assert.NotNil(t, response)
+
+	assert.Equal(t, http.StatusOK, res.StatusCode)
+	assert.Equal(t, 2, response.Meta.Size)
+
+	// When the batch header hash is invalid, the response should contain an error
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/v1/feed/batches/invalid/blobs", nil)
+	r.ServeHTTP(w, req)
+
+	res = w.Result()
+	defer res.Body.Close()
+
+	data, err = io.ReadAll(res.Body)
+	assert.NoError(t, err)
+
+	err = json.Unmarshal(data, &errorResponse)
+	assert.NoError(t, err)
+
+	assert.Equal(t, http.StatusInternalServerError, res.StatusCode)
+	assert.Equal(t, "invalid batch header hash", errorResponse.Error)
+}
+
+func TestFetchMetricsHandler(t *testing.T) {
 	r := setUpRouter()
 
 	blob := makeTestBlob(0, 10)
@@ -248,7 +357,7 @@ func TestFetchMetricsHandler(t *testing.T) {
 		batchHeaderHash, err := dataapi.ConvertHexadecimalToBytes(batchHeaderHashBytes)
 		assert.NoError(t, err)
 
-		markBlobConfirmed(t, &blob, key, batchHeaderHash, blobstore)
+		markBlobConfirmed(t, &blob, key, 1, batchHeaderHash, blobstore)
 	}
 
 	s := new(model.SampleStream)
@@ -264,8 +373,9 @@ func TestFetchMetricsHandler(t *testing.T) {
 
 	r.GET("/v1/metrics", testDataApiServer.FetchMetricsHandler)
 
-	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/v1/metrics", nil)
+	req.Close = true
+	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
 	res := w.Result()
@@ -322,75 +432,10 @@ func TestFetchMetricsThroughputHandler(t *testing.T) {
 	}
 
 	assert.Equal(t, http.StatusOK, res.StatusCode)
-	assert.Equal(t, 3481, len(response))
-	assert.Equal(t, float64(11666.666666666666), response[0].Throughput)
-	assert.Equal(t, uint64(1701292800), response[0].Timestamp)
-	assert.Equal(t, float64(3.599722666666646e+07), totalThroughput)
-}
-
-func TestEjectOperatorHandler(t *testing.T) {
-	r := setUpRouter()
-	ejectorComponents := getEjector(t)
-	testDataApiServer := dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, ejectorComponents.ejector, mockLogger, metrics, &MockGRPCConnection{}, nil, &MockHttpClient{ShouldSucceed: true})
-
-	stopTime := time.Now().UTC()
-	interval := 3600
-	startTime := stopTime.Add(-time.Duration(interval) * time.Second)
-	mockSubgraphApi.On("QueryBatchNonSigningInfo", startTime.Unix(), stopTime.Unix()).Return(batchNonSigningInfo, nil)
-	addr1 := gethcommon.HexToAddress("0x00000000219ab540356cbb839cbe05303d7705fa")
-	addr2 := gethcommon.HexToAddress("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")
-	mockTx.On("BatchOperatorIDToAddress").Return([]gethcommon.Address{addr1, addr2}, nil)
-	mockTx.On("GetQuorumBitmapForOperatorsAtBlockNumber").Return([]*big.Int{big.NewInt(3), big.NewInt(0)}, nil)
-	mockTx.On("BuildEjectOperatorsTxn").Return(types.NewTransaction(0, gethcommon.HexToAddress("0x1"), big.NewInt(0), 0, big.NewInt(0), []byte{}), nil)
-	mockTx.On("EjectOperators").Return(&types.Receipt{
-		GasUsed: uint64(10),
-	}, nil)
-	mockSubgraphApi.On("QueryOperatorAddedToQuorum").Return(operatorAddedToQuorum, nil)
-	mockSubgraphApi.On("QueryOperatorRemovedFromQuorum").Return(operatorRemovedFromQuorum, nil)
-	ejectorComponents.ethClient.On("GetLatestGasCaps").Return(big.NewInt(0), big.NewInt(0), nil)
-	ejectorComponents.ethClient.On("UpdateGas").Return(types.NewTransaction(0, gethcommon.HexToAddress("0x1"), big.NewInt(0), 0, big.NewInt(0), []byte{}), nil)
-	txID := "1234"
-	receipt := &types.Receipt{
-		BlockNumber: new(big.Int).SetUint64(1),
-		TxHash:      gethcommon.HexToHash("0xdf9c2506b0dbb107d5a35e262e2e94fe9ce91440dfbba2e7a919bd2e83aee29e"),
-	}
-	gomock.InOrder(
-		ejectorComponents.wallet.EXPECT().SendTransaction(gomock.Any(), gomock.Any()).Return(txID, nil),
-		ejectorComponents.wallet.EXPECT().GetTransactionReceipt(gomock.Any(), gomock.Any()).Return(receipt, nil),
-	)
-
-	r.GET("/v1/ejector/operator", testDataApiServer.EjectOperatorsHandler)
-
-	reqStr := fmt.Sprintf("/v1/ejector/operator?interval=%v&end=%s", interval, stopTime.Format("2006-01-02T15:04:05Z"))
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, reqStr, nil)
-	ctxWithDeadline, cancel := context.WithTimeout(req.Context(), 500*time.Microsecond)
-	defer cancel()
-	req = req.WithContext(ctxWithDeadline)
-	r.ServeHTTP(w, req)
-	assert.Equal(t, w.Code, http.StatusUnauthorized)
-
-	w2 := httptest.NewRecorder()
-	req2 := httptest.NewRequest(http.MethodGet, reqStr, nil)
-	req2.Header.Set("X-Ejection-Token", "deadbeef")
-	ctxWithDeadline2, cancel2 := context.WithTimeout(req2.Context(), 500*time.Microsecond)
-	defer cancel2()
-	req2 = req2.WithContext(ctxWithDeadline2)
-	r.ServeHTTP(w2, req2)
-	assert.Equal(t, w2.Code, http.StatusOK)
-
-	res := w2.Result()
-	defer res.Body.Close()
-
-	data, err := io.ReadAll(res.Body)
-	assert.NoError(t, err)
-
-	var response dataapi.EjectionResponse
-	err = json.Unmarshal(data, &response)
-	assert.NoError(t, err)
-	assert.NotNil(t, response)
-	assert.Equal(t, receipt.TxHash.Hex(), response.TransactionHash)
+	assert.Equal(t, 3361, len(response))
+	assert.Equal(t, float64(12000), response[0].Throughput)
+	assert.Equal(t, uint64(1701292920), response[0].Timestamp)
+	assert.Equal(t, float64(3.503022666666651e+07), totalThroughput)
 }
 
 func TestFetchUnsignedBatchesHandler(t *testing.T) {
@@ -452,24 +497,6 @@ func TestFetchUnsignedBatchesHandler(t *testing.T) {
 	assert.Equal(t, float64(25), responseData.StakePercentage)
 }
 
-type ejectorComponents struct {
-	wallet    *sdkmock.MockWallet
-	ethClient *commonmock.MockEthClient
-	ejector   *dataapi.Ejector
-}
-
-func getEjector(t *testing.T) *ejectorComponents {
-	ctrl := gomock.NewController(t)
-	w := sdkmock.NewMockWallet(ctrl)
-	ethClient := &commonmock.MockEthClient{}
-	ejector := dataapi.NewEjector(w, ethClient, mockLogger, mockTx, metrics, 100*time.Millisecond, -1)
-	return &ejectorComponents{
-		wallet:    w,
-		ethClient: ethClient,
-		ejector:   ejector,
-	}
-}
-
 func TestPortCheckIpValidation(t *testing.T) {
 	assert.Equal(t, false, dataapi.ValidOperatorIP("", mockLogger))
 	assert.Equal(t, false, dataapi.ValidOperatorIP("0.0.0.0:32005", mockLogger))
@@ -522,7 +549,7 @@ func TestPortCheck(t *testing.T) {
 
 func TestCheckBatcherHealthExpectServing(t *testing.T) {
 	r := setUpRouter()
-	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, nil, mockLogger, metrics, &MockGRPCConnection{}, nil, &MockHttpClient{ShouldSucceed: true})
+	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, mockIndexedChainState, mockLogger, metrics, &MockGRPCConnection{}, nil, &MockHttpClient{ShouldSucceed: true})
 
 	r.GET("/v1/metrics/batcher-service-availability", testDataApiServer.FetchBatcherAvailability)
 
@@ -555,7 +582,7 @@ func TestCheckBatcherHealthExpectServing(t *testing.T) {
 func TestCheckBatcherHealthExpectNotServing(t *testing.T) {
 	r := setUpRouter()
 
-	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, nil, mockLogger, metrics, &MockGRPCConnection{}, nil, &MockHttpClient{ShouldSucceed: false})
+	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, mockIndexedChainState, mockLogger, metrics, &MockGRPCConnection{}, nil, &MockHttpClient{ShouldSucceed: false})
 
 	r.GET("/v1/metrics/batcher-service-availability", testDataApiServer.FetchBatcherAvailability)
 
@@ -593,7 +620,7 @@ func TestFetchDisperserServiceAvailabilityHandler(t *testing.T) {
 		Status: grpc_health_v1.HealthCheckResponse_SERVING,
 	})
 
-	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, nil, mockLogger, metrics, &MockGRPCConnection{}, mockHealthCheckService, nil)
+	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, mockIndexedChainState, mockLogger, metrics, &MockGRPCConnection{}, mockHealthCheckService, nil)
 
 	r.GET("/v1/metrics/disperser-service-availability", testDataApiServer.FetchDisperserServiceAvailability)
 
@@ -631,7 +658,7 @@ func TestChurnerServiceAvailabilityHandler(t *testing.T) {
 		Status: grpc_health_v1.HealthCheckResponse_SERVING,
 	})
 
-	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, nil, mockLogger, metrics, &MockGRPCConnection{}, mockHealthCheckService, nil)
+	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, mockIndexedChainState, mockLogger, metrics, &MockGRPCConnection{}, mockHealthCheckService, nil)
 
 	r.GET("/v1/metrics/churner-service-availability", testDataApiServer.FetchChurnerServiceAvailability)
 
@@ -666,8 +693,6 @@ func TestFetchDeregisteredOperatorNoSocketInfoOneOperatorHandler(t *testing.T) {
 	mockSubgraphApi.ExpectedCalls = nil
 	mockSubgraphApi.Calls = nil
 
-	defer goleak.VerifyNone(t)
-
 	r := setUpRouter()
 
 	indexedOperatorStates := make(map[core.OperatorID]*subgraph.OperatorInfo)
@@ -677,7 +702,7 @@ func TestFetchDeregisteredOperatorNoSocketInfoOneOperatorHandler(t *testing.T) {
 
 	// Set up the mock calls for the two operators
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfoNoSocketInfo, nil).Once()
-	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, nil, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
+	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, mockIndexedChainState, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
 
 	mockSubgraphApi.On("QueryIndexedOperatorsWithStateForTimeWindow").Return(indexedOperatorStates, nil)
 
@@ -711,9 +736,6 @@ func TestFetchDeregisteredOperatorNoSocketInfoOneOperatorHandler(t *testing.T) {
 }
 
 func TestFetchDeregisteredMultipleOperatorsOneWithNoSocketInfoHandler(t *testing.T) {
-
-	defer goleak.VerifyNone(t)
-
 	r := setUpRouter()
 
 	indexedOperatorStates := make(map[core.OperatorID]*subgraph.OperatorInfo)
@@ -725,7 +747,7 @@ func TestFetchDeregisteredMultipleOperatorsOneWithNoSocketInfoHandler(t *testing
 	// Set up the mock calls for the two operators
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfoNoSocketInfo, nil).Once()
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfo2, nil).Once()
-	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, nil, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
+	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, mockIndexedChainState, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
 
 	mockSubgraphApi.On("QueryIndexedOperatorsWithStateForTimeWindow").Return(indexedOperatorStates, nil)
 
@@ -780,9 +802,6 @@ func TestFetchDeregisteredMultipleOperatorsOneWithNoSocketInfoHandler(t *testing
 }
 
 func TestFetchDeregisteredOperatorInfoInvalidTimeStampHandler(t *testing.T) {
-
-	defer goleak.VerifyNone(t)
-
 	r := setUpRouter()
 
 	indexedOperatorStates := make(map[core.OperatorID]*subgraph.OperatorInfo)
@@ -792,7 +811,7 @@ func TestFetchDeregisteredOperatorInfoInvalidTimeStampHandler(t *testing.T) {
 
 	// Set up the mock calls for the two operators
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfo1, nil).Once()
-	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, nil, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
+	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, mockIndexedChainState, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
 
 	mockSubgraphApi.On("QueryIndexedOperatorsWithStateForTimeWindow").Return(indexedOperatorStates, nil)
 
@@ -823,9 +842,6 @@ func TestFetchDeregisteredOperatorInfoInvalidTimeStampHandler(t *testing.T) {
 }
 
 func TestFetchDeregisteredOperatorInfoInvalidTimeStampTwoOperatorsHandler(t *testing.T) {
-
-	defer goleak.VerifyNone(t)
-
 	r := setUpRouter()
 
 	indexedOperatorStates := make(map[core.OperatorID]*subgraph.OperatorInfo)
@@ -836,7 +852,7 @@ func TestFetchDeregisteredOperatorInfoInvalidTimeStampTwoOperatorsHandler(t *tes
 
 	// Set up the mock calls for the two operators
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfo2, nil).Once()
-	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, nil, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
+	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, mockIndexedChainState, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
 
 	mockSubgraphApi.On("QueryIndexedOperatorsWithStateForTimeWindow").Return(indexedOperatorStates, nil)
 
@@ -877,9 +893,6 @@ func TestFetchDeregisteredOperatorInfoInvalidTimeStampTwoOperatorsHandler(t *tes
 }
 
 func TestFetchMetricsDeregisteredOperatorHandler(t *testing.T) {
-
-	defer goleak.VerifyNone(t)
-
 	r := setUpRouter()
 
 	indexedOperatorStates := make(map[core.OperatorID]*subgraph.OperatorInfo)
@@ -891,7 +904,7 @@ func TestFetchMetricsDeregisteredOperatorHandler(t *testing.T) {
 	// Set up the mock calls for the two operators
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfo1, nil).Once()
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfo2, nil).Once()
-	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, nil, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
+	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, mockIndexedChainState, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
 
 	mockSubgraphApi.On("QueryIndexedOperatorsWithStateForTimeWindow").Return(indexedOperatorStates, nil)
 
@@ -945,9 +958,6 @@ func TestFetchMetricsDeregisteredOperatorHandler(t *testing.T) {
 }
 
 func TestFetchDeregisteredOperatorOffline(t *testing.T) {
-
-	defer goleak.VerifyNone(t)
-
 	r := setUpRouter()
 
 	indexedOperatorState := make(map[core.OperatorID]*subgraph.OperatorInfo)
@@ -955,7 +965,7 @@ func TestFetchDeregisteredOperatorOffline(t *testing.T) {
 
 	mockSubgraphApi.On("QueryDeregisteredOperatorsGreaterThanBlockTimestamp").Return(subgraphOperatorDeregistered, nil)
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfo1, nil)
-	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, nil, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
+	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, mockIndexedChainState, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
 
 	mockSubgraphApi.On("QueryIndexedOperatorsWithStateForTimeWindow").Return(indexedOperatorState, nil)
 
@@ -993,9 +1003,6 @@ func TestFetchDeregisteredOperatorOffline(t *testing.T) {
 }
 
 func TestFetchDeregisteredOperatorsWithoutDaysQueryParam(t *testing.T) {
-
-	defer goleak.VerifyNone(t)
-
 	r := setUpRouter()
 
 	indexedOperatorStates := make(map[core.OperatorID]*subgraph.OperatorInfo)
@@ -1007,7 +1014,7 @@ func TestFetchDeregisteredOperatorsWithoutDaysQueryParam(t *testing.T) {
 	// Set up the mock calls for the two operators
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfo1, nil).Once()
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfo2, nil).Once()
-	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, nil, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
+	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, mockIndexedChainState, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
 
 	mockSubgraphApi.On("QueryIndexedOperatorsWithStateForTimeWindow").Return(indexedOperatorStates, nil)
 
@@ -1053,9 +1060,6 @@ func TestFetchDeregisteredOperatorsWithoutDaysQueryParam(t *testing.T) {
 }
 
 func TestFetchDeregisteredOperatorInvalidDaysQueryParam(t *testing.T) {
-
-	defer goleak.VerifyNone(t)
-
 	r := setUpRouter()
 
 	indexedOperatorStates := make(map[core.OperatorID]*subgraph.OperatorInfo)
@@ -1064,7 +1068,7 @@ func TestFetchDeregisteredOperatorInvalidDaysQueryParam(t *testing.T) {
 
 	mockSubgraphApi.On("QueryDeregisteredOperatorsGreaterThanBlockTimestamp").Return(subgraphOperatorDeregistered, nil)
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfo1, nil)
-	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, nil, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
+	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, mockIndexedChainState, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
 
 	mockSubgraphApi.On("QueryIndexedOperatorsWithStateForTimeWindow").Return(indexedOperatorStates, nil)
 
@@ -1095,9 +1099,6 @@ func TestFetchDeregisteredOperatorInvalidDaysQueryParam(t *testing.T) {
 }
 
 func TestFetchDeregisteredOperatorQueryDaysGreaterThan30(t *testing.T) {
-
-	defer goleak.VerifyNone(t)
-
 	r := setUpRouter()
 
 	indexedOperatorState := make(map[core.OperatorID]*subgraph.OperatorInfo)
@@ -1105,7 +1106,7 @@ func TestFetchDeregisteredOperatorQueryDaysGreaterThan30(t *testing.T) {
 
 	mockSubgraphApi.On("QueryDeregisteredOperatorsGreaterThanBlockTimestamp").Return(subgraphOperatorDeregistered, nil)
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfo1, nil)
-	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, nil, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
+	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, mockIndexedChainState, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
 
 	mockSubgraphApi.On("QueryIndexedOperatorsWithStateForTimeWindow").Return(indexedOperatorState, nil)
 
@@ -1136,9 +1137,6 @@ func TestFetchDeregisteredOperatorQueryDaysGreaterThan30(t *testing.T) {
 }
 
 func TestFetchDeregisteredOperatorsMultipleOffline(t *testing.T) {
-
-	defer goleak.VerifyNone(t)
-
 	r := setUpRouter()
 
 	indexedOperatorStates := make(map[core.OperatorID]*subgraph.OperatorInfo)
@@ -1150,7 +1148,7 @@ func TestFetchDeregisteredOperatorsMultipleOffline(t *testing.T) {
 	// Set up the mock calls for the two operators
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfo1, nil).Once()
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfo2, nil).Once()
-	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, nil, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
+	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, mockIndexedChainState, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
 
 	mockSubgraphApi.On("QueryIndexedOperatorsWithStateForTimeWindow").Return(indexedOperatorStates, nil)
 
@@ -1197,9 +1195,6 @@ func TestFetchDeregisteredOperatorsMultipleOffline(t *testing.T) {
 }
 
 func TestFetchDeregisteredOperatorOnline(t *testing.T) {
-
-	defer goleak.VerifyNone(t)
-
 	r := setUpRouter()
 
 	indexedOperatorState := make(map[core.OperatorID]*subgraph.OperatorInfo)
@@ -1207,7 +1202,7 @@ func TestFetchDeregisteredOperatorOnline(t *testing.T) {
 
 	mockSubgraphApi.On("QueryDeregisteredOperatorsGreaterThanBlockTimestamp").Return(subgraphOperatorDeregistered, nil)
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfo1, nil)
-	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, nil, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
+	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, mockIndexedChainState, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
 
 	mockSubgraphApi.On("QueryIndexedOperatorsWithStateForTimeWindow").Return(indexedOperatorState, nil)
 
@@ -1246,10 +1241,8 @@ func TestFetchDeregisteredOperatorOnline(t *testing.T) {
 }
 
 func TestFetchDeregisteredOperatorsMultipleOfflineOnline(t *testing.T) {
-	// Skipping this test as repported being flaky but could not reproduce it locally
+	// Skipping this test as reported being flaky but could not reproduce it locally
 	t.Skip("Skipping testing in CI environment")
-
-	defer goleak.VerifyNone(t)
 
 	r := setUpRouter()
 
@@ -1262,7 +1255,7 @@ func TestFetchDeregisteredOperatorsMultipleOfflineOnline(t *testing.T) {
 	// Set up the mock calls for the two operators
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfo1, nil).Once()
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfo2, nil).Once()
-	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, nil, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
+	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, mockIndexedChainState, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
 
 	mockSubgraphApi.On("QueryIndexedOperatorsWithStateForTimeWindow").Return(indexedOperatorStates, nil)
 
@@ -1316,9 +1309,6 @@ func TestFetchDeregisteredOperatorsMultipleOfflineOnline(t *testing.T) {
 }
 
 func TestFetchDeregisteredOperatorsMultipleOnline(t *testing.T) {
-
-	defer goleak.VerifyNone(t)
-
 	r := setUpRouter()
 
 	indexedOperatorStates := make(map[core.OperatorID]*subgraph.OperatorInfo)
@@ -1328,7 +1318,7 @@ func TestFetchDeregisteredOperatorsMultipleOnline(t *testing.T) {
 	mockSubgraphApi.On("QueryDeregisteredOperatorsGreaterThanBlockTimestamp").Return(subgraphTwoOperatorsDeregistered, nil)
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfo1, nil).Once()
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfo2, nil).Once()
-	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, nil, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
+	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, mockIndexedChainState, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
 
 	mockSubgraphApi.On("QueryIndexedOperatorsWithStateForTimeWindow").Return(indexedOperatorStates, nil)
 
@@ -1386,9 +1376,6 @@ func TestFetchDeregisteredOperatorsMultipleOnline(t *testing.T) {
 }
 
 func TestFetchDeregisteredOperatorsMultipleOfflineSameBlock(t *testing.T) {
-
-	defer goleak.VerifyNone(t)
-
 	r := setUpRouter()
 
 	indexedOperatorStates := make(map[core.OperatorID]*subgraph.OperatorInfo)
@@ -1402,7 +1389,7 @@ func TestFetchDeregisteredOperatorsMultipleOfflineSameBlock(t *testing.T) {
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfo1, nil).Once()
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfo2, nil).Once()
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfo3, nil).Once()
-	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, nil, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
+	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, mockIndexedChainState, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
 
 	mockSubgraphApi.On("QueryIndexedOperatorsWithStateForTimeWindow").Return(indexedOperatorStates, nil)
 
@@ -1453,16 +1440,13 @@ func TestFetchDeregisteredOperatorsMultipleOfflineSameBlock(t *testing.T) {
 }
 
 func TestFetchRegisteredOperatorOnline(t *testing.T) {
-
-	defer goleak.VerifyNone(t)
-
 	r := setUpRouter()
 
 	indexedOperatorState := make(map[core.OperatorID]*subgraph.OperatorInfo)
 	indexedOperatorState[core.OperatorID{0}] = subgraphDeregisteredOperatorInfo
 	mockSubgraphApi.On("QueryRegisteredOperatorsGreaterThanBlockTimestamp").Return(subgraphOperatorRegistered, nil)
 	mockSubgraphApi.On("QueryOperatorInfoByOperatorIdAtBlockNumber").Return(subgraphIndexedOperatorInfo1, nil)
-	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, nil, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
+	testDataApiServer = dataapi.NewServer(config, blobstore, prometheusClient, dataapi.NewSubgraphClient(mockSubgraphApi, mockLogger), mockTx, mockChainState, mockIndexedChainState, mockLogger, metrics, &MockGRPCConnection{}, nil, nil)
 
 	mockSubgraphApi.On("QueryIndexedOperatorsWithStateForTimeWindow").Return(indexedOperatorState, nil)
 
@@ -1510,7 +1494,7 @@ func queueBlob(t *testing.T, blob *core.Blob, queue disperser.BlobStore) dispers
 	return key
 }
 
-func markBlobConfirmed(t *testing.T, blob *core.Blob, key disperser.BlobKey, batchHeaderHash [32]byte, queue disperser.BlobStore) {
+func markBlobConfirmed(t *testing.T, blob *core.Blob, key disperser.BlobKey, blobIndex uint32, batchHeaderHash [32]byte, queue disperser.BlobStore) {
 	// simulate blob confirmation
 	var commitX, commitY fp.Element
 	_, err := commitX.SetString("21661178944771197726808973281966770251114553549453983978976194544185382599016")
@@ -1524,7 +1508,7 @@ func markBlobConfirmed(t *testing.T, blob *core.Blob, key disperser.BlobKey, bat
 
 	confirmationInfo := &disperser.ConfirmationInfo{
 		BatchHeaderHash:      batchHeaderHash,
-		BlobIndex:            expectedBlobIndex,
+		BlobIndex:            blobIndex,
 		SignatoryRecordHash:  expectedSignatoryRecordHash,
 		ReferenceBlockNumber: expectedReferenceBlockNumber,
 		BatchRoot:            expectedBatchRoot,

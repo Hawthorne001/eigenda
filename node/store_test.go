@@ -3,6 +3,7 @@ package node_test
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"testing"
 	"time"
 
@@ -14,8 +15,8 @@ import (
 	"github.com/Layr-Labs/eigenda/encoding"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 
+	"github.com/Layr-Labs/eigenda/common/testutils"
 	"github.com/Layr-Labs/eigenda/node"
-	"github.com/Layr-Labs/eigensdk-go/logging"
 	"github.com/Layr-Labs/eigensdk-go/metrics"
 	"github.com/consensys/gnark-crypto/ecc/bn254"
 	"github.com/consensys/gnark-crypto/ecc/bn254/fp"
@@ -24,8 +25,17 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// Creates a batch and returns its header and blobs.
+const (
+	staleMeasure  = uint32(1)
+	storeDuration = uint32(1)
+)
+
 func CreateBatch(t *testing.T) (*core.BatchHeader, []*core.BlobMessage, []*pb.Blob) {
+	return CreateBatchWith(t, false)
+}
+
+// Creates a batch and returns its header and blobs.
+func CreateBatchWith(t *testing.T, encodeBundle bool) (*core.BatchHeader, []*core.BlobMessage, []*pb.Blob) {
 	var commitX, commitY, lengthX, lengthY fp.Element
 	_, err := commitX.SetString("21661178944771197726808973281966770251114553549453983978976194544185382599016")
 	assert.NoError(t, err)
@@ -75,6 +85,11 @@ func CreateBatch(t *testing.T) (*core.BatchHeader, []*core.BlobMessage, []*pb.Bl
 		Coeffs: []encoding.Symbol{encoding.ONE},
 	}
 	chunk1bytes, err := chunk1.Serialize()
+	assert.Nil(t, err)
+	bundle1 := core.Bundle{
+		chunk1,
+	}
+	bundle1bytes, err := bundle1.Serialize()
 	assert.Nil(t, err)
 
 	blobMessage := []*core.BlobMessage{
@@ -165,12 +180,22 @@ func CreateBatch(t *testing.T) (*core.BatchHeader, []*core.BlobMessage, []*pb.Bl
 		Length:        uint32(50),
 		QuorumHeaders: []*pb.BlobQuorumInfo{quorumHeaderProto},
 	}
-	bundles := []*pb.Bundle{
-		{
-			Chunks: [][]byte{
-				chunk1bytes,
+	var bundles []*pb.Bundle
+	if encodeBundle {
+		bundles = []*pb.Bundle{
+			{
+				Bundle: bundle1bytes,
 			},
-		},
+		}
+	} else {
+		bundles = []*pb.Bundle{
+			{
+				Chunks: [][]byte{
+					chunk1bytes,
+				},
+			},
+		}
+
 	}
 	blobs := []*pb.Blob{
 		{
@@ -185,19 +210,58 @@ func CreateBatch(t *testing.T) (*core.BatchHeader, []*core.BlobMessage, []*pb.Bl
 	return &batchHeader, blobMessage, blobs
 }
 
-func TestStoringBlob(t *testing.T) {
-	staleMeasure := uint32(1)
-	storeDuration := uint32(1)
+func createStore(t *testing.T) *node.Store {
 	noopMetrics := metrics.NewNoopMetrics()
 	reg := prometheus.NewRegistry()
-	logger := logging.NewNoopLogger()
+	logger := testutils.GetLogger()
 	operatorId := [32]byte(hexutil.MustDecode("0x3fbfefcdc76462d2cdb7d0cea75f27223829481b8b4aa6881c94cb2126a316ad"))
-	tx := &coremock.MockTransactor{}
+	tx := &coremock.MockWriter{}
 	dat, _ := mock.MakeChainDataMock(map[uint8]int{
 		0: 6,
 		1: 3,
 	})
 	s, _ := node.NewLevelDBStore(t.TempDir(), logger, node.NewMetrics(noopMetrics, reg, logger, ":9090", operatorId, -1, tx, dat), staleMeasure, storeDuration)
+	return s
+}
+
+func TestEncodeDecodeChunks(t *testing.T) {
+	decoded, format, err := node.DecodeChunks([]byte{})
+	assert.Nil(t, err)
+	assert.Equal(t, pb.ChunkEncodingFormat_UNKNOWN, format)
+	assert.Equal(t, 0, len(decoded))
+
+	numSamples := 32
+	numChunks := 10
+	chunkSize := 2 * 1024
+	for n := 0; n < numSamples; n++ {
+		chunks := make([][]byte, numChunks)
+		for i := 0; i < numChunks; i++ {
+			chunk := make([]byte, chunkSize)
+			_, _ = cryptorand.Read(chunk)
+			chunks[i] = chunk
+		}
+		encoded, err := node.EncodeChunks(chunks)
+		assert.Nil(t, err)
+		decoded, format, err := node.DecodeChunks(encoded)
+		assert.Nil(t, err)
+		assert.Equal(t, pb.ChunkEncodingFormat_GOB, format)
+		for i := 0; i < numChunks; i++ {
+			assert.True(t, bytes.Equal(decoded[i], chunks[i]))
+		}
+	}
+}
+
+func TestStoreBatchInvalidBlob(t *testing.T) {
+	s := createStore(t)
+	ctx := context.Background()
+	batchHeader, blobs, blobsProto := CreateBatchWith(t, true)
+	blobsProto[0].Bundles[0].Chunks = [][]byte{[]byte{1}}
+	_, err := s.StoreBatch(ctx, batchHeader, blobs, blobsProto)
+	assert.EqualError(t, err, "chunks of a bundle are encoded together already")
+}
+
+func TestStoreBatchSuccess(t *testing.T) {
+	s := createStore(t)
 	ctx := context.Background()
 
 	// Empty store
@@ -225,14 +289,26 @@ func TestStoringBlob(t *testing.T) {
 	blobHeaderKey1, err := node.EncodeBlobHeaderKey(batchHeaderHash, 0)
 	assert.Nil(t, err)
 	assert.True(t, s.HasKey(ctx, blobHeaderKey1))
+
 	blobHeaderKey2, err := node.EncodeBlobHeaderKey(batchHeaderHash, 1)
 	assert.Nil(t, err)
 	assert.True(t, s.HasKey(ctx, blobHeaderKey2))
+
 	blobHeaderBytes1, err := s.GetBlobHeader(ctx, batchHeaderHash, 0)
 	assert.Nil(t, err)
 	expected, err := proto.Marshal(blobsProto[0].GetHeader())
 	assert.Nil(t, err)
 	assert.True(t, bytes.Equal(blobHeaderBytes1, expected))
+
+	blobHeaderBytes2, err := s.GetBlobHeader(ctx, batchHeaderHash, 1)
+	assert.Nil(t, err)
+	expected, err = proto.Marshal(blobsProto[1].GetHeader())
+	assert.Nil(t, err)
+	assert.True(t, bytes.Equal(blobHeaderBytes2, expected))
+
+	blobHeaderBytes3, err := s.GetBlobHeader(ctx, batchHeaderHash, 2)
+	assert.ErrorIs(t, err, node.ErrKeyNotFound)
+	assert.Nil(t, blobHeaderBytes3)
 
 	// Check existence: blob chunks.
 	blobKey1, err := node.EncodeBlobKey(batchHeaderHash, 0, 0)
@@ -242,6 +318,16 @@ func TestStoringBlob(t *testing.T) {
 	assert.Nil(t, err)
 	assert.True(t, s.HasKey(ctx, blobKey2))
 
+	// Check the chunks.
+	chunks, format, err := s.GetChunks(ctx, batchHeaderHash, 0, 0)
+	assert.Nil(t, err)
+	assert.Equal(t, pb.ChunkEncodingFormat_GOB, format)
+	assert.Equal(t, chunks, blobsProto[0].Bundles[0].Chunks)
+	chunks, format, err = s.GetChunks(ctx, batchHeaderHash, 1, 0)
+	assert.Nil(t, err)
+	assert.Equal(t, pb.ChunkEncodingFormat_GOB, format)
+	assert.Equal(t, chunks, blobsProto[1].Bundles[0].Chunks)
+
 	// Store the batch again it should be no-op.
 	_, err = s.StoreBatch(ctx, batchHeader, blobs, blobsProto)
 	assert.NotNil(t, err)
@@ -250,12 +336,12 @@ func TestStoringBlob(t *testing.T) {
 	// Expire the batches.
 	curTime := time.Now().Unix() + int64(staleMeasure+storeDuration)*12
 	// Try to expire at a time before expiry, so nothing will be expired.
-	numDeleted, err := s.DeleteExpiredEntries(curTime-10, 1)
+	numDeleted, _, _, err := s.DeleteExpiredEntries(curTime-10, 1)
 	assert.Nil(t, err)
 	assert.Equal(t, numDeleted, 0)
 	assert.True(t, s.HasKey(ctx, batchHeaderKey))
 	// Then expire it at a time post expiry, so the batch will get purged.
-	numDeleted, err = s.DeleteExpiredEntries(curTime+10, 1)
+	numDeleted, _, _, err = s.DeleteExpiredEntries(curTime+10, 1)
 	assert.Nil(t, err)
 	assert.Equal(t, numDeleted, 1)
 	assert.False(t, s.HasKey(ctx, batchHeaderKey))
@@ -263,4 +349,102 @@ func TestStoringBlob(t *testing.T) {
 	assert.False(t, s.HasKey(ctx, blobHeaderKey2))
 	assert.False(t, s.HasKey(ctx, blobKey1))
 	assert.False(t, s.HasKey(ctx, blobKey2))
+}
+
+func decodeChunks(t *testing.T, s *node.Store, batchHeaderHash [32]byte, blobIdx int, chunkEncoding pb.ChunkEncodingFormat) []*encoding.Frame {
+	ctx := context.Background()
+	chunks, format, err := s.GetChunks(ctx, batchHeaderHash, blobIdx, 0)
+	assert.Nil(t, err)
+	assert.Equal(t, 1, len(chunks))
+	assert.Equal(t, chunkEncoding, format)
+	var f *encoding.Frame
+	switch chunkEncoding {
+	case pb.ChunkEncodingFormat_GOB:
+		f, err = new(encoding.Frame).Deserialize(chunks[0])
+		assert.Nil(t, err)
+	case pb.ChunkEncodingFormat_GNARK:
+		f, err = new(encoding.Frame).DeserializeGnark(chunks[0])
+		assert.Nil(t, err)
+	}
+	return []*encoding.Frame{f}
+}
+
+func checkBundleEquivalence(t *testing.T, bundle1, bundle2 []*encoding.Frame) {
+	assert.Equal(t, len(bundle1), len(bundle2))
+	for i := 0; i < len(bundle1); i++ {
+		assert.True(t, bundle1[i].Proof.Equal(&bundle2[i].Proof))
+		assert.Equal(t, len(bundle1[i].Coeffs), len(bundle2[i].Coeffs))
+		for j := 0; j < len(bundle1[i].Coeffs); j++ {
+			assert.True(t, bundle1[i].Coeffs[j].Equal(&bundle2[i].Coeffs[j]))
+		}
+	}
+}
+
+func TestBundleEncodingEquivalence(t *testing.T) {
+	ctx := context.Background()
+	// Gnark chunks
+	s1 := createStore(t)
+	batchHeader1, blobs1, blobsProto1 := CreateBatchWith(t, true)
+	_, err := s1.StoreBatch(ctx, batchHeader1, blobs1, blobsProto1)
+	assert.Nil(t, err)
+	// Gob chunks
+	s2 := createStore(t)
+	batchHeader2, blobs2, blobsProto2 := CreateBatchWith(t, false)
+	_, err = s2.StoreBatch(ctx, batchHeader2, blobs2, blobsProto2)
+	assert.Nil(t, err)
+
+	// Check parity
+	batchHeaderHash, err := batchHeader1.GetBatchHeaderHash()
+	assert.Nil(t, err)
+	// The first blob
+	bundle1 := decodeChunks(t, s1, batchHeaderHash, 0, pb.ChunkEncodingFormat_GNARK)
+	bundle2 := decodeChunks(t, s2, batchHeaderHash, 0, pb.ChunkEncodingFormat_GOB)
+	checkBundleEquivalence(t, bundle1, bundle2)
+	// The second blob
+	bundle1 = decodeChunks(t, s1, batchHeaderHash, 1, pb.ChunkEncodingFormat_GNARK)
+	bundle2 = decodeChunks(t, s2, batchHeaderHash, 1, pb.ChunkEncodingFormat_GOB)
+	checkBundleEquivalence(t, bundle1, bundle2)
+}
+
+func BenchmarkEncodeChunks(b *testing.B) {
+	numSamples := 32
+	numChunks := 10
+	chunkSize := 2 * 1024
+	sampleChunks := make([][][]byte, numSamples)
+	for n := 0; n < numSamples; n++ {
+		chunks := make([][]byte, numChunks)
+		for i := 0; i < numChunks; i++ {
+			chunk := make([]byte, chunkSize)
+			_, _ = cryptorand.Read(chunk)
+			chunks[i] = chunk
+		}
+		sampleChunks[n] = chunks
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = node.EncodeChunks(sampleChunks[i%numSamples])
+	}
+}
+
+func BenchmarkDecocodeChunks(b *testing.B) {
+	numSamples := 32
+	numChunks := 10
+	chunkSize := 2 * 1024
+	sampleChunks := make([][]byte, numSamples)
+	for n := 0; n < numSamples; n++ {
+		chunks := make([][]byte, numChunks)
+		for i := 0; i < numChunks; i++ {
+			chunk := make([]byte, chunkSize)
+			_, _ = cryptorand.Read(chunk)
+			chunks[i] = chunk
+		}
+		encoded, _ := node.EncodeChunks(chunks)
+		sampleChunks[n] = encoded
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, _ = node.DecodeChunks(sampleChunks[i%numSamples])
+	}
 }

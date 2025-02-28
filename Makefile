@@ -3,11 +3,15 @@
 ifeq ($(wildcard .git/*),)
 $(warning semver disabled - building from release zip)
 GITCOMMIT := ""
+GITSHA := ""
 GITDATE := ""
+BRANCH := ""
 SEMVER := $(shell basename $(CURDIR))
 else
 GITCOMMIT := $(shell git rev-parse --short HEAD)
 GITDATE := $(shell git log -1 --format=%cd --date=unix)
+GITSHA := $(shell git rev-parse HEAD)
+BRANCH := $(shell git rev-parse --abbrev-ref HEAD | sed 's/[^[:alnum:]\.\_\-]/-/g')
 SEMVER := $(shell docker run --rm --volume "$(PWD):/repo" gittools/gitversion:5.12.0 /repo -output json -showvariable SemVer)
 ifeq ($(SEMVER), )
 $(warning semver disabled - docker not installed)
@@ -17,37 +21,20 @@ endif
 
 RELEASE_TAG := $(or $(RELEASE_TAG),latest)
 
-PROTOS := ./api/proto
-PROTOS_DISPERSER := ./disperser/api/proto
-PROTO_GEN := ./api/grpc
-PROTO_GEN_DISPERSER_PATH = ./disperser/api/grpc
-
-compile-el:
-	cd contracts && ./compile.sh compile-el
-
-compile-dl:
-	cd contracts && ./compile.sh compile-dl
+compile-contracts:
+	cd contracts && ./compile.sh
 
 clean:
-	find $(PROTO_GEN) -name "*.pb.go" -type f | xargs rm -rf
-	mkdir -p $(PROTO_GEN)
-	find $(PROTO_GEN_DISPERSER_PATH) -name "*.pb.go" -type f | xargs rm -rf
-	mkdir -p $(PROTO_GEN_DISPERSER_PATH)
+	./api/builder/clean.sh
 
+# Builds the protobuf files inside a docker container.
 protoc: clean
-	protoc -I $(PROTOS) \
-	--go_out=$(PROTO_GEN) \
-	--go_opt=paths=source_relative \
-	--go-grpc_out=$(PROTO_GEN) \
-	--go-grpc_opt=paths=source_relative \
-	$(PROTOS)/**/*.proto
-	# Generate Protobuf for sub directories of ./api/proto/disperser
-	protoc -I $(PROTOS_DISPERSER) -I $(PROTOS) \
-	--go_out=$(PROTO_GEN_DISPERSER_PATH) \
-	--go_opt=paths=source_relative \
-	--go-grpc_out=$(PROTO_GEN_DISPERSER_PATH) \
-	--go-grpc_opt=paths=source_relative \
-	$(PROTOS_DISPERSER)/**/*.proto
+	./api/builder/protoc-docker.sh
+	./api/builder/generate-docs.sh
+
+# Builds the protobuf files locally (i.e. without docker).
+protoc-local: clean
+	./api/builder/protoc.sh
 
 lint:
 	golint -set_exit_status ./...
@@ -61,12 +48,16 @@ build:
 	cd retriever && make build
 	cd tools/traffic && make build
 	cd tools/kzgpad && make build
+	cd relay && make build
 
 dataapi-build:
 	cd disperser && go build -o ./bin/dataapi ./cmd/dataapi
 
 unit-tests:
 	./test.sh
+
+fuzz-tests:
+	go test --fuzz=FuzzParseSignatureKMS -fuzztime=5m ./common
 
 integration-tests-churner:
 	go test -v ./churner/tests
@@ -94,10 +85,8 @@ integration-tests-dataapi:
 	go test -v ./disperser/dataapi
 
 docker-release-build:
-	RELEASE_TAG=${SEMVER} docker compose -f docker-compose-release.yaml build --build-arg SEMVER=${SEMVER} --build-arg GITCOMMIT=${GITCOMMIT} --build-arg GITDATE=${GITDATE} 
-
-docker-release-push:
-	RELEASE_TAG=${SEMVER} docker compose -f docker-compose-release.yaml push
+	BUILD_TAG=${SEMVER} SEMVER=${SEMVER} GITDATE=${GITDATE} GIT_SHA=${GITSHA} GIT_SHORT_SHA=${GITCOMMIT} \
+	docker buildx bake node-group-release ${PUSH_FLAG}
 
 semver:
 	echo "${SEMVER}"

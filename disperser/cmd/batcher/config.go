@@ -31,6 +31,8 @@ type Config struct {
 
 	BLSOperatorStateRetrieverAddr string
 	EigenDAServiceManagerAddr     string
+
+	EnableGnarkBundleEncoding bool
 }
 
 func NewConfig(ctx *cli.Context) (Config, error) {
@@ -85,6 +87,7 @@ func NewConfig(ctx *cli.Context) (Config, error) {
 		IndexerDataDir:                ctx.GlobalString(flags.IndexerDataDirFlag.Name),
 		IndexerConfig:                 indexer.ReadIndexerConfig(ctx),
 		KMSKeyConfig:                  kmsConfig,
+		EnableGnarkBundleEncoding:     ctx.Bool(flags.EnableGnarkBundleEncodingFlag.Name),
 	}
 	return config, nil
 }

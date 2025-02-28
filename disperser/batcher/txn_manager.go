@@ -208,7 +208,7 @@ func (t *txnManager) ensureAnyTransactionBroadcasted(ctx context.Context, txs []
 	for {
 		for _, tx := range txs {
 			_, err := t.wallet.GetTransactionReceipt(ctx, tx.TxID)
-			if err == nil || errors.Is(err, walletsdk.ErrReceiptNotYetAvailable) {
+			if err == nil || errors.Is(err, ethereum.NotFound) || errors.Is(err, walletsdk.ErrReceiptNotYetAvailable) {
 				t.metrics.ObserveLatency("broadcasted", float64(time.Since(tx.requestedAt).Milliseconds()))
 				return nil
 			}
@@ -241,9 +241,10 @@ func (t *txnManager) ensureAnyTransactionEvaled(ctx context.Context, txs []*tran
 				chainTip, err := t.ethClient.BlockNumber(ctx)
 				if err == nil {
 					if receipt.BlockNumber.Uint64()+uint64(t.numConfirmations) > chainTip {
-						t.logger.Debug("transaction has been mined but don't have enough confirmations at current chain tip", "txnBlockNumber", receipt.BlockNumber.Uint64(), "numConfirmations", t.numConfirmations, "chainTip", chainTip)
+						t.logger.Debug("transaction has been mined but don't have enough confirmations at current chain tip", "nonce", tx.Nonce(), "txnBlockNumber", receipt.BlockNumber.Uint64(), "numConfirmations", t.numConfirmations, "chainTip", chainTip)
 						break
 					} else {
+						t.logger.Info("transaction has been mined and has enough confirmations", "nonce", tx.Nonce(), "txnBlockNumber", receipt.BlockNumber.Uint64(), "numConfirmations", t.numConfirmations, "chainTip", chainTip)
 						return receipt, nil
 					}
 				} else {

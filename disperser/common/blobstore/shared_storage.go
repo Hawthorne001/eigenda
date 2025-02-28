@@ -19,6 +19,8 @@ const (
 	maxS3BlobFetchWorkers = 64
 )
 
+var errProcessingToDispersing = errors.New("blob transit to dispersing from non processing")
+
 // The shared blob store that the disperser is operating on.
 // The metadata store is backed by DynamoDB and the blob store is backed by S3.
 //
@@ -112,7 +114,13 @@ func (s *SharedBlobStore) StoreBlob(ctx context.Context, blob *core.Blob, reques
 	}
 	err = s.blobMetadataStore.QueueNewBlobMetadata(ctx, &metadata)
 	if err != nil {
-		s.logger.Error("error uploading blob metadata", "err", err)
+		if errors.Is(err, context.Canceled) {
+			s.logger.Warn("context canceled while queuing new blob metadata", "err", err)
+		} else if errors.Is(err, context.DeadlineExceeded) {
+			s.logger.Warn("context deadline exceeded while queuing new blob metadata", "err", err)
+		} else {
+			s.logger.Error("error uploading blob metadata", "err", err)
+		}
 		return metadataKey, err
 	}
 
@@ -157,18 +165,35 @@ func (s *SharedBlobStore) MarkBlobConfirmed(ctx context.Context, existingMetadat
 }
 
 func (s *SharedBlobStore) MarkBlobDispersing(ctx context.Context, metadataKey disperser.BlobKey) error {
+	refreshedMetadata, err := s.GetBlobMetadata(ctx, metadataKey)
+	if err != nil {
+		s.logger.Error("error getting blob metadata while marking blobDispersing", "err", err)
+		return err
+	}
+
+	status := refreshedMetadata.BlobStatus
+	if status != disperser.Processing {
+		s.logger.Error("error marking blob as dispersing from non processing state", "blobKey", metadataKey.String(), "status", status)
+		return errProcessingToDispersing
+	}
+
 	return s.blobMetadataStore.SetBlobStatus(ctx, metadataKey, disperser.Dispersing)
 }
 
 func (s *SharedBlobStore) MarkBlobInsufficientSignatures(ctx context.Context, existingMetadata *disperser.BlobMetadata, confirmationInfo *disperser.ConfirmationInfo) (*disperser.BlobMetadata, error) {
+	if existingMetadata == nil {
+		return nil, errors.New("metadata is nil")
+	}
 	newMetadata := *existingMetadata
 	newMetadata.BlobStatus = disperser.InsufficientSignatures
-	newMetadata.ConfirmationInfo = confirmationInfo
+	if confirmationInfo != nil {
+		newMetadata.ConfirmationInfo = confirmationInfo
+	}
 	return &newMetadata, s.blobMetadataStore.UpdateBlobMetadata(ctx, existingMetadata.GetBlobKey(), &newMetadata)
 }
 
-func (s *SharedBlobStore) MarkBlobFinalized(ctx context.Context, metadataKey disperser.BlobKey) error {
-	return s.blobMetadataStore.SetBlobStatus(ctx, metadataKey, disperser.Finalized)
+func (s *SharedBlobStore) MarkBlobFinalized(ctx context.Context, blobKey disperser.BlobKey) error {
+	return s.blobMetadataStore.SetBlobStatus(ctx, blobKey, disperser.Finalized)
 }
 
 func (s *SharedBlobStore) MarkBlobProcessing(ctx context.Context, metadataKey disperser.BlobKey) error {
@@ -183,6 +208,10 @@ func (s *SharedBlobStore) MarkBlobFailed(ctx context.Context, metadataKey disper
 
 func (s *SharedBlobStore) IncrementBlobRetryCount(ctx context.Context, existingMetadata *disperser.BlobMetadata) error {
 	return s.blobMetadataStore.IncrementNumRetries(ctx, existingMetadata)
+}
+
+func (s *SharedBlobStore) UpdateConfirmationBlockNumber(ctx context.Context, existingMetadata *disperser.BlobMetadata, confirmationBlockNumber uint32) error {
+	return s.blobMetadataStore.UpdateConfirmationBlockNumber(ctx, existingMetadata, confirmationBlockNumber)
 }
 
 func (s *SharedBlobStore) GetBlobsByMetadata(ctx context.Context, metadata []*disperser.BlobMetadata) (map[disperser.BlobKey]*core.Blob, error) {
@@ -232,9 +261,17 @@ func (s *SharedBlobStore) GetAllBlobMetadataByBatch(ctx context.Context, batchHe
 	return s.blobMetadataStore.GetAllBlobMetadataByBatch(ctx, batchHeaderHash)
 }
 
+func (s *SharedBlobStore) GetAllBlobMetadataByBatchWithPagination(ctx context.Context, batchHeaderHash [32]byte, limit int32, exclusiveStartKey *disperser.BatchIndexExclusiveStartKey) ([]*disperser.BlobMetadata, *disperser.BatchIndexExclusiveStartKey, error) {
+	return s.blobMetadataStore.GetAllBlobMetadataByBatchWithPagination(ctx, batchHeaderHash, limit, exclusiveStartKey)
+}
+
 // GetMetadata returns a blob metadata given a metadata key
 func (s *SharedBlobStore) GetBlobMetadata(ctx context.Context, metadataKey disperser.BlobKey) (*disperser.BlobMetadata, error) {
 	return s.blobMetadataStore.GetBlobMetadata(ctx, metadataKey)
+}
+
+func (s *SharedBlobStore) GetBulkBlobMetadata(ctx context.Context, blobKeys []disperser.BlobKey) ([]*disperser.BlobMetadata, error) {
+	return s.blobMetadataStore.GetBulkBlobMetadata(ctx, blobKeys)
 }
 
 func (s *SharedBlobStore) HandleBlobFailure(ctx context.Context, metadata *disperser.BlobMetadata, maxRetry uint) (bool, error) {
